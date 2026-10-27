@@ -38,6 +38,21 @@ import { fileURLToPath } from "url";
 import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { encode as encodeXGnarly } from "./xgnarly.mjs";
+import {
+  BLOCKED_RESOURCE_TYPES,
+  IDLE_SHUTDOWN_MS,
+  LEAN_CHROME_FLAGS,
+  STATIC_CACHE_HOST_PATTERN,
+  STATIC_CACHE_MAX_BYTES,
+  WARM_ON_START,
+} from "./lib/config.mjs";
+import { buildChromeArgs } from "./lib/chrome-flags.mjs";
+import { ActivityTracker, startIdleReaper } from "./lib/idle-reaper.mjs";
+import {
+  StaticAssetCache,
+  rememberResponse,
+  respondFromCache,
+} from "./lib/static-asset-cache.mjs";
 
 // Use stealth plugin with default evasions
 puppeteer.use(StealthPlugin());
@@ -136,6 +151,16 @@ const SIGNED_CACHE_MAX_AGE_MS = 60_000;
 
 let browser = null;
 let browserLaunch = null; // in-flight launch promise
+let browserClosing = null; // in-flight close promise (idle shutdown / exit)
+
+// Requests that need the browser; the idle reaper closes it when this is quiet.
+const activity = new ActivityTracker();
+
+// TikTok's static bundle, downloaded once and replayed to every new identity.
+const staticCache = new StaticAssetCache({
+  maxBytes: STATIC_CACHE_MAX_BYTES,
+  hostPattern: STATIC_CACHE_HOST_PATTERN,
+});
 
 let identitySeq = 0;
 /** @type {Identity[]} */
@@ -290,23 +315,21 @@ function getChromePath() {
 }
 
 async function ensureBrowser() {
+  // A relaunch must wait for an idle shutdown to finish: both use the same
+  // profile directory, and the shutdown deletes it at the end.
+  if (browserClosing) await browserClosing;
   if (browser && browser.connected) return browser;
   if (browserLaunch) return browserLaunch;
 
   browserLaunch = (async () => {
     console.log("[Server] Launching browser...");
 
-    const browserArgs = [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-blink-features=AutomationControlled",
-      "--disable-gpu",
-      "--window-size=1920,1080",
-    ];
+    const browserArgs = buildChromeArgs({
+      lean: LEAN_CHROME_FLAGS,
+      proxyHost: PROXY_ENABLED ? PROXY_HOST : undefined,
+    });
 
     if (PROXY_ENABLED) {
-      browserArgs.push(`--proxy-server=http://${PROXY_HOST}`);
       console.log(`[Server] Proxy enabled: ${PROXY_HOST}`);
     } else {
       console.log("[Server] Proxy disabled - direct connection");
@@ -325,7 +348,9 @@ async function ensureBrowser() {
     });
 
     b.on("disconnected", () => {
-      console.error("[Server] Browser disconnected — pool will be rebuilt");
+      if (!browserClosing) {
+        console.error("[Server] Browser disconnected — pool will be rebuilt");
+      }
       browser = null;
       for (const idn of identities) {
         idn.ready = false;
@@ -346,32 +371,53 @@ async function ensureBrowser() {
 }
 
 async function closeBrowser() {
-  for (const idn of identities) {
-    idn.ready = false;
-    idn.retired = true;
-  }
-  identities.length = 0;
+  if (browserClosing) return browserClosing;
 
-  if (browser) {
+  browserClosing = (async () => {
+    for (const idn of identities) {
+      idn.ready = false;
+      idn.retired = true;
+    }
+    identities.length = 0;
+
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (e) {
+        console.error("[Server] Error closing browser:", e.message);
+      }
+      browser = null;
+    }
+
+    // Clean up user data directory to prevent disk space accumulation
     try {
-      await browser.close();
+      if (fs.existsSync(USER_DATA_DIR)) {
+        fs.rmSync(USER_DATA_DIR, { recursive: true, force: true });
+        console.log("[Server] Cleaned up browser profile directory");
+      }
     } catch (e) {
-      console.error("[Server] Error closing browser:", e.message);
+      console.error("[Server] Error cleaning up profile:", e.message);
     }
-    browser = null;
-  }
 
-  // Clean up user data directory to prevent disk space accumulation
+    console.log("[Server] Browser closed, all state reset");
+  })();
+
   try {
-    if (fs.existsSync(USER_DATA_DIR)) {
-      fs.rmSync(USER_DATA_DIR, { recursive: true, force: true });
-      console.log("[Server] Cleaned up browser profile directory");
-    }
-  } catch (e) {
-    console.error("[Server] Error cleaning up profile:", e.message);
+    await browserClosing;
+  } finally {
+    browserClosing = null;
   }
+}
 
-  console.log("[Server] Browser closed, all state reset");
+/** Background work that must finish before the browser may be closed. */
+function hasBackgroundWork() {
+  return (
+    !!browserLaunch ||
+    !!poolWarming ||
+    replacementsInFlight > 0 ||
+    isProcessingQueue ||
+    requestQueue.length > 0
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -484,11 +530,17 @@ async function initPageWithLocalSdk(idn) {
     }
 
     // Block heavy resources to speed up loading
-    if (["image", "media", "font"].includes(resourceType)) {
+    if (BLOCKED_RESOURCE_TYPES.has(resourceType)) {
       try {
         await request.abort();
       } catch (e) {}
       return;
+    }
+
+    try {
+      if (await respondFromCache(request, staticCache)) return;
+    } catch (e) {
+      // Replay failed — fall through to the network.
     }
 
     try {
@@ -582,6 +634,12 @@ async function createIdentity() {
         });
       } catch (e) {}
     });
+
+    if (staticCache.enabled) {
+      page.on("response", (response) =>
+        rememberResponse(response, staticCache),
+      );
+    }
 
     // Authenticate with proxy if enabled
     if (PROXY_ENABLED && PROXY_USER && PROXY_PASS) {
@@ -1071,6 +1129,8 @@ function poolStats() {
   };
 }
 
+const BROWSER_WORK_PATHS = new Set(["/signature", "/fetch", "/restart"]);
+
 /**
  * HTTP Request Handler
  */
@@ -1087,6 +1147,11 @@ async function handleRequest(req, res) {
     res.end();
     return;
   }
+
+  // Only real work keeps the browser alive; /health polling must not.
+  const endActivity = BROWSER_WORK_PATHS.has(url.pathname)
+    ? activity.begin()
+    : null;
 
   try {
     // Health check
@@ -1107,6 +1172,10 @@ async function handleRequest(req, res) {
           localSdkAvailable: !!localSdkContent,
           proxyEnabled: PROXY_ENABLED,
           userAgent: currentUserAgent,
+          browserRunning: !!browser,
+          idleSeconds: Math.round(activity.idleMs / 1000),
+          idleShutdownMinutes: IDLE_SHUTDOWN_MS / 60000,
+          staticCache: staticCache.stats(),
         }),
       );
       return;
@@ -1363,6 +1432,8 @@ async function handleRequest(req, res) {
     console.error("[Server] Error:", e.message);
     res.writeHead(500);
     res.end(JSON.stringify({ status: "error", message: e.message }));
+  } finally {
+    endActivity?.();
   }
 }
 
@@ -1385,8 +1456,19 @@ server.listen(PORT, () => {
     `  GET  /restart   - Retire all identities and warm a fresh pool`,
   );
 
-  // Warm the pool on startup
-  warmPool().catch((e) => console.error("[Server] Init failed:", e.message));
+  if (WARM_ON_START) {
+    warmPool().catch((e) => console.error("[Server] Init failed:", e.message));
+  } else {
+    console.log("[Server] Lazy start: browser launches on the first request");
+  }
+
+  startIdleReaper({
+    idleMs: IDLE_SHUTDOWN_MS,
+    tracker: activity,
+    isRunning: () => !!browser,
+    isBusy: hasBackgroundWork,
+    shutdown: closeBrowser,
+  });
 });
 
 // Graceful shutdown
