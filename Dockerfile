@@ -1,7 +1,9 @@
 # TikTok Signature Server
 FROM node:20-slim
 
-# Install Chromium and dependencies
+# Install Chromium and dependencies.
+# tini runs as PID 1 and reaps Chromium's exited child processes, which Node
+# does not do — without it zombie renderers pile up as identities rotate.
 RUN apt-get update && apt-get install -y \
     chromium \
     fonts-liberation \
@@ -21,27 +23,29 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 \
     xdg-utils \
     curl \
+    tini \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# Use the system Chromium. These must be set BEFORE `npm ci`, otherwise
+# Puppeteer's postinstall downloads its own Chrome into the image as well.
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
+    PUPPETEER_SKIP_DOWNLOAD=true \
+    NODE_ENV=production \
+    PORT=8080
+
 # Copy package files
 COPY package*.json ./
 
 # Install dependencies (production only)
-RUN npm ci --only=production
+RUN npm ci --omit=dev && npm cache clean --force
 
 # Copy application files
-COPY server.mjs ./
-COPY xgnarly.mjs ./
-COPY benchmark.mjs ./
+COPY server.mjs xgnarly.mjs benchmark.mjs ./
+COPY lib/ ./lib/
 COPY javascript/ ./javascript/
-
-# Set Chrome path for Puppeteer
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-ENV PORT=8080
 
 EXPOSE 8080
 
@@ -49,4 +53,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "server.mjs"]

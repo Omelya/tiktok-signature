@@ -398,19 +398,46 @@ See the `examples/` folder for more complete examples (comments, search, trendin
 
 ### Environment Variables
 
-| Variable                         | Default   | Description                                                |
-| -------------------------------- | --------- | ---------------------------------------------------------- |
-| `PORT`                           | `8080`    | Server port                                                |
-| `PROXY_ENABLED`                  | `false`   | Enable proxy support                                       |
-| `PROXY_HOST`                     | -         | Proxy host and port (e.g., `proxy.example.com:8080`)       |
-| `PROXY_USER`                     | -         | Proxy username                                             |
-| `PROXY_PASS`                     | -         | Proxy password                                             |
-| `PUPPETEER_EXECUTABLE_PATH`      | auto      | Custom Chrome/Chromium path                                |
-| `IDENTITY_POOL_SIZE`             | `3`       | Browser identities kept warm; requests rotate through them |
-| `MAX_GENERATIONS_BEFORE_REFRESH` | `500`     | Signatures one identity may emit before it is retired      |
-| `MAX_SESSION_AGE_MS`             | `1800000` | Identity age (ms) before it is retired                     |
-| `REPORT_MIN_AGE_MS`              | `15000`   | `/report` is ignored for identities younger than this (ms) |
-| `REPORT_RETIRE_COOLDOWN_MS`      | `20000`   | Minimum gap (ms) between report-driven retirements         |
+| Variable                         | Default            | Description                                                |
+| -------------------------------- | ------------------ | ---------------------------------------------------------- |
+| `PORT`                           | `8080`             | Server port                                                |
+| `PROXY_ENABLED`                  | `false`            | Enable proxy support                                       |
+| `PROXY_HOST`                     | -                  | Proxy host and port (e.g., `proxy.example.com:8080`)       |
+| `PROXY_USER`                     | -                  | Proxy username                                             |
+| `PROXY_PASS`                     | -                  | Proxy password                                             |
+| `PUPPETEER_EXECUTABLE_PATH`      | auto               | Custom Chrome/Chromium path                                |
+| `IDENTITY_POOL_SIZE`             | `3`                | Browser identities kept warm; requests rotate through them |
+| `MAX_GENERATIONS_BEFORE_REFRESH` | `500`              | Signatures one identity may emit before it is retired      |
+| `MAX_SESSION_AGE_MS`             | `1800000`          | Identity age (ms) before it is retired                     |
+| `REPORT_MIN_AGE_MS`              | `15000`            | `/report` is ignored for identities younger than this (ms) |
+| `REPORT_RETIRE_COOLDOWN_MS`      | `20000`            | Minimum gap (ms) between report-driven retirements         |
+| `IDLE_SHUTDOWN_MS`               | `600000`           | Close Chromium after this long without work; `0` = never   |
+| `WARM_ON_START`                  | `true`             | Launch the browser at startup (`false` = on first request) |
+| `STATIC_CACHE_MAX_MB`            | `64`               | Shared cache for TikTok's static JS/CSS; `0` = off         |
+| `BLOCKED_RESOURCE_TYPES`         | `image,media,font` | Request types aborted while an identity loads              |
+| `LEAN_CHROME_FLAGS`              | `true`             | Disable Chromium's background services                     |
+
+### Low-resource mode
+
+The expensive part of this server is Chromium, not the signing itself. These
+options keep it small:
+
+- **Idle shutdown** — with no `/signature`, `/fetch` or `/restart` calls for
+  `IDLE_SHUTDOWN_MS`, the browser is closed (≈0 CPU, only the Node process stays
+  in RAM). The next request relaunches it, so the first call after a quiet period
+  waits for a fresh identity (~10–20 s). `/health` polling does not count as
+  activity; it reports `browserRunning` and `idleSeconds`.
+- **Shared static cache** — each identity is its own incognito context, so Chromium
+  never shares its HTTP cache between them and every new identity downloaded
+  TikTok's whole JS bundle again (through the proxy, which is often billed per GB).
+  Scripts/styles from TikTok's CDN are now kept in memory (LRU, `STATIC_CACHE_MAX_MB`)
+  and replayed to later identities. `/health` shows `staticCache.hits`.
+- **Smaller pool** — for low or bursty traffic `IDENTITY_POOL_SIZE=1` is usually
+  enough; each identity is a full TikTok tab.
+- **Lean Chromium flags** — updater, sync, translate, crash reporter etc. are off.
+  None of these flags change what a page can see (UA, viewport, GPU, headless mode).
+- **Docker** — the image no longer bundles a second Chrome downloaded by Puppeteer,
+  and runs under `tini` so exited Chromium processes are reaped.
 
 ### Identity pool
 
